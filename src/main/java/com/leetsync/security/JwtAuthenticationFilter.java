@@ -62,7 +62,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 // Load user from database
                 User user = userRepository.findById(userId).orElse(null);
                 
-                if (user != null && user.getGithubConnected()) {
+                if (user != null && Boolean.TRUE.equals(user.getGithubConnected())) {
                     // Create authentication token
                     UsernamePasswordAuthenticationToken authenticationToken =
                         new UsernamePasswordAuthenticationToken(
