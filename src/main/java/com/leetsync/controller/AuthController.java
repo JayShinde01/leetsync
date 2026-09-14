@@ -1,49 +1,29 @@
 package com.leetsync.controller;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.util.LinkedHashMap;
-import java.util.Map;
-
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.Authentication;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.view.RedirectView;
-
 import com.leetsync.dto.AuthResponse;
 import com.leetsync.dto.UserResponse;
 import com.leetsync.entity.User;
 import com.leetsync.service.AuthService;
 
-import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.responses.ApiResponse;
-import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
-/**
- * Authentication controller for V3 multi-user LeetSync.
- *
- * Handles:
- * - GitHub OAuth login initiation
- * - GitHub OAuth callback
- * - User profile retrieval
- * - Logout
- */
-@Slf4j
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.view.RedirectView;
+
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
 @RestController
 @RequestMapping("/api/auth")
 @RequiredArgsConstructor
-@Tag(
-    name = "Authentication",
-    description = "GitHub OAuth and user authentication endpoints"
-)
+@Slf4j
+@CrossOrigin(origins = "*")
 public class AuthController {
 
     private final AuthService authService;
@@ -54,303 +34,296 @@ public class AuthController {
     @Value("${github.oauth-redirect-uri}")
     private String githubRedirectUri;
 
-    /**
-     * Chrome Extension OAuth success page.
+    /*
+     * Chrome extension OAuth callback.
      *
-     * IMPORTANT:
-     * Replace this extension ID with your actual Chrome extension ID.
-     *
-     * Example:
-     * chrome-extension://abcdefghijklmnop/auth-success.html
+     * This must match the Chrome extension ID.
      */
-    @Value("${leetsync.extension-success-url}")
-    private String extensionSuccessUrl;
+    private static final String EXTENSION_OAUTH_CALLBACK =
+            "https://bhjiihcbpajmpcnjpkeklnbgbjkebpge.chromiumapp.org/";
 
     /**
-     * Initiates GitHub OAuth login.
+     * Start GitHub OAuth.
      *
-     * Returns the GitHub authorization URL.
+     * The extension calls this endpoint to get
+     * the GitHub authorization URL.
      */
     @GetMapping("/github")
-    @Operation(
-        summary = "Initiate GitHub login",
-        description = "Returns URL for GitHub OAuth authorization"
-    )
-    @ApiResponse(
-        responseCode = "200",
-        description = "GitHub login URL"
-    )
-    public ResponseEntity<Map<String, String>> initiateGitHubLogin() {
+    public ResponseEntity<Map<String, String>> startGitHubOAuth() {
 
-        log.info("GitHub login initiated");
+        String url =
+                "https://github.com/login/oauth/authorize"
+                        + "?client_id=" + encode(githubClientId)
+                        + "&redirect_uri=" + encode(githubRedirectUri)
+                        + "&scope=" + encode("repo");
 
-        String githubAuthUrl =
-            "https://github.com/login/oauth/authorize"
-            + "?client_id="
-            + encode(githubClientId)
-            + "&redirect_uri="
-            + encode(githubRedirectUri)
-            + "&scope="
-            + encode("repo");
+        log.info("Starting GitHub OAuth flow.");
 
-        Map<String, String> response = new LinkedHashMap<>();
-        response.put("url", githubAuthUrl);
-
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(
+                Map.of("url", url)
+        );
     }
 
     /**
-     * Handles GitHub OAuth callback.
+     * GitHub OAuth callback.
      *
-     * After successful authentication:
+     * GitHub redirects here after the user authorizes
+     * the application.
      *
-     * Backend
-     *   ↓
-     * Generate JWT
-     *   ↓
-     * Redirect to Chrome Extension
-     *   ↓
-     * auth-success.html?token=JWT
+     * The backend:
+     * 1. Exchanges the GitHub code for an access token.
+     * 2. Creates or updates the user.
+     * 3. Generates our JWT.
+     * 4. Redirects to Chrome's chromiumapp.org callback.
      */
     @GetMapping("/github/callback")
-    @Operation(
-        summary = "GitHub OAuth callback",
-        description = "Processes GitHub authorization code"
-    )
-    public RedirectView handleGitHubCallback(
-        @RequestParam(required = false) String code,
-        @RequestParam(required = false) String error
-    ) {
+    public RedirectView githubCallback(
+            @RequestParam(required = false) String code,
+            @RequestParam(required = false) String error,
+            @RequestParam(
+                    required = false,
+                    name = "error_description"
+            ) String errorDescription) {
 
         /*
-         * Handle GitHub OAuth denial/error.
+         * GitHub authorization was rejected/cancelled.
          */
-        if (error != null && !error.isBlank()) {
+        if (error != null) {
 
             log.warn(
-                "GitHub OAuth error: {}",
-                error
+                    "GitHub OAuth returned error: {} - {}",
+                    error,
+                    errorDescription
             );
 
-            String redirectUrl =
-                extensionSuccessUrl
-                + "?success=false"
-                + "&error="
-                + encode(error);
+            String message =
+                    errorDescription != null
+                            ? errorDescription
+                            : error;
 
-            return redirect(redirectUrl);
+            return redirectWithError(message);
         }
 
         /*
-         * Validate authorization code.
+         * GitHub did not provide an authorization code.
          */
         if (code == null || code.isBlank()) {
 
             log.warn(
-                "Missing authorization code in GitHub callback"
+                    "GitHub OAuth callback received without code."
             );
 
-            String redirectUrl =
-                extensionSuccessUrl
-                + "?success=false"
-                + "&error="
-                + encode("Authorization code is required");
-
-            return redirect(redirectUrl);
+            return redirectWithError(
+                    "GitHub authorization code was missing."
+            );
         }
 
         try {
 
+            log.info("GitHub OAuth callback received.");
+
             /*
-             * Exchange GitHub authorization code,
-             * create/update user,
-             * encrypt GitHub token,
-             * generate LeetSync JWT.
+             * AuthService handles:
+             * - GitHub access token exchange
+             * - GitHub user information
+             * - User creation/update
+             * - Token encryption
+             * - JWT generation
              */
             AuthResponse authResponse =
-                authService.handleGitHubCallback(code);
+                    authService.handleGitHubCallback(code);
 
-            /*
-             * Authentication failed.
-             */
-            if (!authResponse.isSuccess()
-                    || authResponse.getToken() == null
-                    || authResponse.getToken().isBlank()) {
+            if (authResponse == null) {
 
-                log.warn(
-                    "GitHub authentication failed"
+                log.error(
+                        "AuthService returned null authentication response."
                 );
 
-                String message =
-                    authResponse.getMessage() != null
-                        ? authResponse.getMessage()
-                        : "GitHub authentication failed";
-
-                String redirectUrl =
-                    extensionSuccessUrl
-                    + "?success=false"
-                    + "&error="
-                    + encode(message);
-
-                return redirect(redirectUrl);
+                return redirectWithError(
+                        "Authentication failed."
+                );
             }
 
             /*
-             * Authentication successful.
-             *
-             * Pass the JWT to the extension.
+             * AuthService returns success=false when
+             * authentication fails.
              */
-            String token = authResponse.getToken();
+            if (!authResponse.isSuccess()) {
 
-            String redirectUrl =
-                extensionSuccessUrl
-                + "?success=true"
-                + "&token="
-                + encode(token);
+                String message =
+                        authResponse.getMessage() != null
+                                ? authResponse.getMessage()
+                                : "GitHub authentication failed.";
+
+                log.warn(
+                        "GitHub authentication failed: {}",
+                        message
+                );
+
+                return redirectWithError(message);
+            }
+
+            /*
+             * Get our application's JWT.
+             */
+            String jwt = authResponse.getToken();
+
+            if (jwt == null || jwt.isBlank()) {
+
+                log.error(
+                        "Authentication succeeded but JWT was missing."
+                );
+
+                return redirectWithError(
+                        "Authentication token was not generated."
+                );
+            }
 
             log.info(
-                "GitHub authentication successful. "
-                + "Redirecting user to Chrome Extension."
+                    "GitHub authentication successful. "
+                            + "Redirecting to Chrome OAuth callback."
             );
 
-            return redirect(redirectUrl);
+            /*
+             * Redirect to Chrome's OAuth callback.
+             *
+             * popup.js receives this URL through
+             * chrome.identity.launchWebAuthFlow().
+             */
+            String redirectUrl =
+                    EXTENSION_OAUTH_CALLBACK
+                            + "?success=true"
+                            + "&token=" + encode(jwt);
+
+            return new RedirectView(redirectUrl);
 
         } catch (Exception e) {
 
             log.error(
-                "GitHub OAuth callback processing failed",
-                e
+                    "GitHub OAuth callback failed.",
+                    e
             );
 
-            String redirectUrl =
-                extensionSuccessUrl
-                + "?success=false"
-                + "&error="
-                + encode("Authentication failed");
-
-            return redirect(redirectUrl);
+            return redirectWithError(
+                    "GitHub authentication failed."
+            );
         }
     }
 
     /**
-     * Get current authenticated user profile.
-     *
-     * Requires JWT authentication.
+     * Get currently authenticated user.
      */
     @GetMapping("/me")
-    @Operation(
-        summary = "Get current user",
-        description = "Returns profile of authenticated user"
-    )
     public ResponseEntity<?> getCurrentUser(
-        Authentication authentication
-    ) {
+            Authentication authentication) {
 
+        /*
+         * JWT filter should populate Authentication.
+         */
         if (authentication == null
                 || !authentication.isAuthenticated()
                 || !(authentication.getPrincipal() instanceof User)) {
 
-            log.warn(
-                "Unauthenticated user attempted to access /api/auth/me"
-            );
-
-            Map<String, Object> response =
-                new LinkedHashMap<>();
-
-            response.put("success", false);
-            response.put("message", "Not authenticated");
-
             return ResponseEntity
-                .status(HttpStatus.UNAUTHORIZED)
-                .body(response);
+                    .status(HttpStatus.UNAUTHORIZED)
+                    .body(
+                            Map.of(
+                                    "success", false,
+                                    "message",
+                                    "Authentication required."
+                            )
+                    );
         }
 
         User user =
-            (User) authentication.getPrincipal();
+                (User) authentication.getPrincipal();
 
-        log.debug(
-            "Retrieving profile for user: {}",
-            user.getGithubUsername()
-        );
+        try {
 
-        UserResponse userResponse =
-            authService.getUserProfile(user.getId());
+            UserResponse userResponse =
+                    authService.getUserProfile(user.getId());
 
-        Map<String, Object> response =
-            new LinkedHashMap<>();
+            return ResponseEntity.ok(
+                    Map.of(
+                            "success", true,
+                            "user", userResponse
+                    )
+            );
 
-        response.put("success", true);
-        response.put("user", userResponse);
+        } catch (Exception e) {
 
-        return ResponseEntity.ok(response);
+            log.error(
+                    "Failed to load authenticated user profile.",
+                    e
+            );
+
+            return ResponseEntity
+                    .status(
+                            HttpStatus.INTERNAL_SERVER_ERROR
+                    )
+                    .body(
+                            Map.of(
+                                    "success", false,
+                                    "message",
+                                    "Could not load user profile."
+                            )
+                    );
+        }
     }
 
     /**
-     * Logout endpoint.
+     * Logout.
      *
-     * JWT is stateless, so the actual token is removed
-     * by the Chrome Extension.
+     * JWT authentication is stateless.
+     * The extension removes the JWT locally.
      */
     @PostMapping("/logout")
-    @Operation(
-        summary = "Logout",
-        description = "Logout current user"
-    )
     public ResponseEntity<?> logout(
-        Authentication authentication
-    ) {
+            Authentication authentication) {
 
         if (authentication != null
                 && authentication.getPrincipal() instanceof User) {
 
             User user =
-                (User) authentication.getPrincipal();
+                    (User) authentication.getPrincipal();
 
             log.info(
-                "User logout: {}",
-                user.getGithubUsername()
+                    "User logged out: {}",
+                    user.getGithubUsername()
             );
         }
 
-        Map<String, Object> response =
-            new LinkedHashMap<>();
-
-        response.put("success", true);
-        response.put(
-            "message",
-            "Logged out successfully"
+        return ResponseEntity.ok(
+                Map.of(
+                        "success", true,
+                        "message",
+                        "Logged out successfully."
+                )
         );
-
-        return ResponseEntity.ok(response);
     }
 
     /**
-     * Safely URL-encodes OAuth parameters.
+     * Redirect to Chrome OAuth callback with an error.
+     */
+    private RedirectView redirectWithError(
+            String message) {
+
+        String redirectUrl =
+                EXTENSION_OAUTH_CALLBACK
+                        + "?success=false"
+                        + "&error=" + encode(message);
+
+        return new RedirectView(redirectUrl);
+    }
+
+    /**
+     * Safely URL-encode query parameters.
      */
     private String encode(String value) {
 
-        if (value == null) {
-            return "";
-        }
-
         return URLEncoder.encode(
-            value,
-            StandardCharsets.UTF_8
+                value == null ? "" : value,
+                StandardCharsets.UTF_8
         );
-    }
-
-    /**
-     * Creates a redirect response.
-     */
-    private RedirectView redirect(String url) {
-
-        RedirectView redirectView =
-            new RedirectView(url);
-
-        redirectView.setStatusCode(
-            HttpStatus.FOUND
-        );
-
-        return redirectView;
     }
 }
